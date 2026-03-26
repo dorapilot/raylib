@@ -1144,7 +1144,7 @@ int InitPlatform(void) {
     return -1;
   }
 
-  if (init_touch("/dev/input/event0")) {
+  if (init_touch("/dev/input/by-path/platform-894000.i2c-event")) {
     TRACELOG(LOG_WARNING, "COMMA: Failed to initialize touch device, continuing without touch");
   }
 
