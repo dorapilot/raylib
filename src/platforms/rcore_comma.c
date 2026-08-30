@@ -603,7 +603,7 @@ static const char *find_backlight(void) {
   return NULL;
 }
 
-static int turn_screen_on () {
+static int set_screen_power(bool on) {
   const char *bl = find_backlight();
   if (!bl) {
     TRACELOG(LOG_WARNING, "COMMA: No backlight device found");
@@ -613,17 +613,26 @@ static int turn_screen_on () {
   char filepath[512];
   snprintf(filepath, sizeof(filepath), "%s/bl_power", bl);
   FILE *f = open_with_retry(filepath, "w");
-  if (f) {
-    fputs("0", f);
-    fclose(f);
-  } else {
+  if (!f) {
     TRACELOG(LOG_WARNING, "COMMA: Failed to open bl_power");
     return -1;
   }
 
+  fputs(on ? "0" : "4", f);
+  fclose(f);
+  return 0;
+}
+
+static int turn_screen_on () {
+  if (set_screen_power(true)) {
+    return -1;
+  }
+
+  const char *bl = find_backlight();
+  char filepath[512];
   unsigned long max_brightness = 0;
   snprintf(filepath, sizeof(filepath), "%s/max_brightness", bl);
-  f = open_with_retry(filepath, "r");
+  FILE *f = open_with_retry(filepath, "r");
   if (f) {
     fscanf(f, "%lu", &max_brightness);
     fclose(f);
@@ -783,8 +792,7 @@ void SetWindowState(unsigned int flags) {
   }
 
   if (platform.drm.display_state == DISPLAY_STATE_ACTIVE) {
-    if (drmModeSetCrtc(platform.drm.fd, platform.drm.crtc_id, 0, 0, 0, NULL, 0, NULL) != 0) {
-      TRACELOG(LOG_WARNING, "COMMA: Failed to disable display: %s", strerror(errno));
+    if (set_screen_power(false)) {
       return;
     }
   }
@@ -998,36 +1006,42 @@ void SwapScreenBuffer(void) {
     return;
   }
 
-  if (platform.drm.display_state == DISPLAY_STATE_WAKE_PENDING) {
-    if (drmModeSetCrtc(platform.drm.fd, platform.drm.crtc_id, platform.gbm.next_fb, 0, 0,
-                       &platform.drm.connector_id, 1, &platform.drm.mode) != 0) {
-      TRACELOG(LOG_WARNING, "COMMA: Failed to enable display: %s", strerror(errno));
-      gbm_surface_release_buffer(platform.gbm.surface, platform.gbm.next_bo);
-      platform.gbm.next_bo = NULL;
-      platform.gbm.next_fb = 0;
-      return;
-    }
-    platform.drm.display_state = DISPLAY_STATE_ACTIVE;
-  } else {
-    // page flip may return EBUSY when GPU compute shares the DRM device (mainline MSM DRM).
-    // fall back to blocking drmModeSetCrtc to force the display update through.
-    // without this, back-to-back compute submits starve the page flip and the UI never recovers.
-    if (drmModePageFlip(platform.drm.fd, platform.drm.crtc_id, platform.gbm.next_fb, 0, NULL) != 0) {
-      drmModeSetCrtc(platform.drm.fd, platform.drm.crtc_id, platform.gbm.next_fb, 0, 0,
-                     &platform.drm.connector_id, 1, &platform.drm.mode);
-    }
+  // page flip may return EBUSY when GPU compute shares the DRM device (mainline MSM DRM).
+  // fall back to blocking drmModeSetCrtc to force the display update through.
+  // without this, back-to-back compute submits starve the page flip and the UI never recovers.
+  int display_update_result = drmModePageFlip(platform.drm.fd, platform.drm.crtc_id, platform.gbm.next_fb, 0, NULL);
+  if (display_update_result != 0) {
+    display_update_result = drmModeSetCrtc(platform.drm.fd, platform.drm.crtc_id, platform.gbm.next_fb, 0, 0,
+                                          &platform.drm.connector_id, 1, &platform.drm.mode);
+  }
+
+  if ((platform.drm.display_state == DISPLAY_STATE_WAKE_PENDING) && (display_update_result != 0)) {
+    TRACELOG(LOG_WARNING, "COMMA: Failed to update display before unblanking: %s", strerror(errno));
+    gbm_surface_release_buffer(platform.gbm.surface, platform.gbm.next_bo);
+    platform.gbm.next_bo = NULL;
+    platform.gbm.next_fb = 0;
+    return;
   }
 
   drmVBlank v = {0};
   v.request.type = DRM_VBLANK_RELATIVE;
   v.request.sequence = 1;
-  drmWaitVBlank(platform.drm.fd, &v);
-  if (platform.debug_mode) {
+  int vblank_result = drmWaitVBlank(platform.drm.fd, &v);
+  if ((platform.drm.display_state == DISPLAY_STATE_WAKE_PENDING) && (vblank_result != 0)) {
+    TRACELOG(LOG_WARNING, "COMMA: Failed to wait for fresh frame before unblanking: %s", strerror(errno));
+  }
+  if (platform.debug_mode && (vblank_result == 0)) {
     if ((v.reply.sequence - vblank_id) > 1) {
       TRACELOG(LOG_WARNING, "%i FRAME(s) DROPPED!", (v.reply.sequence - vblank_id) - 1);
     }
   }
-  vblank_id = v.reply.sequence;
+  if (vblank_result == 0) {
+    vblank_id = v.reply.sequence;
+  }
+
+  if ((platform.drm.display_state == DISPLAY_STATE_WAKE_PENDING) && (vblank_result == 0) && (set_screen_power(true) == 0)) {
+    platform.drm.display_state = DISPLAY_STATE_ACTIVE;
+  }
 
   if (platform.gbm.current_bo) {
     gbm_surface_release_buffer(platform.gbm.surface, platform.gbm.current_bo);
