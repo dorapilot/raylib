@@ -81,6 +81,12 @@ typedef enum {
     FINGER_STATE_TOUCHING, // state when finger is touching panel at any time
 } FingerState;
 
+typedef enum {
+  DISPLAY_STATE_ACTIVE = 0,
+  DISPLAY_STATE_INACTIVE,
+  DISPLAY_STATE_WAKE_PENDING,
+} DisplayState;
+
 struct finger {
   FingerState state;
   int x;
@@ -108,6 +114,7 @@ struct drm_platform {
   uint32_t crtc_id;
 
   drmModeModeInfo mode;
+  DisplayState display_state;
 };
 
 // hold all the low level gbm stuff
@@ -673,6 +680,7 @@ static int init_screen () {
     return -1;
   }
 
+  platform.drm.display_state = DISPLAY_STATE_ACTIVE;
   return 0;
 }
 
@@ -769,12 +777,33 @@ void RestoreWindow(void) {
 
 // Set window configuration state using flags
 void SetWindowState(unsigned int flags) {
-  TRACELOG(LOG_WARNING, "SetWindowState() not available on target platform");
+  if (!(flags & FLAG_WINDOW_HIDDEN)) {
+    TRACELOG(LOG_WARNING, "SetWindowState() flags not available on target platform");
+    return;
+  }
+
+  if (platform.drm.display_state == DISPLAY_STATE_ACTIVE) {
+    if (drmModeSetCrtc(platform.drm.fd, platform.drm.crtc_id, 0, 0, 0, NULL, 0, NULL) != 0) {
+      TRACELOG(LOG_WARNING, "COMMA: Failed to disable display: %s", strerror(errno));
+      return;
+    }
+  }
+
+  platform.drm.display_state = DISPLAY_STATE_INACTIVE;
+  CORE.Window.flags |= FLAG_WINDOW_HIDDEN;
 }
 
 // Clear window configuration state flags
 void ClearWindowState(unsigned int flags) {
-  TRACELOG(LOG_WARNING, "ClearWindowState() not available on target platform");
+  if (!(flags & FLAG_WINDOW_HIDDEN)) {
+    TRACELOG(LOG_WARNING, "ClearWindowState() flags not available on target platform");
+    return;
+  }
+
+  if (platform.drm.display_state == DISPLAY_STATE_INACTIVE) {
+    platform.drm.display_state = DISPLAY_STATE_WAKE_PENDING;
+  }
+  CORE.Window.flags &= ~FLAG_WINDOW_HIDDEN;
 }
 
 // Set icon for window
@@ -950,6 +979,10 @@ void DisableCursor(void) {
 void SwapScreenBuffer(void) {
   static uint32_t vblank_id = 0;
 
+  if (platform.drm.display_state == DISPLAY_STATE_INACTIVE) {
+    return;
+  }
+
   eglSwapBuffers(platform.egl.display, platform.egl.surface);
 
   platform.gbm.next_bo = gbm_surface_lock_front_buffer(platform.gbm.surface);
@@ -965,12 +998,24 @@ void SwapScreenBuffer(void) {
     return;
   }
 
-  // page flip may return EBUSY when GPU compute shares the DRM device (mainline MSM DRM).
-  // fall back to blocking drmModeSetCrtc to force the display update through.
-  // without this, back-to-back compute submits starve the page flip and the UI never recovers.
-  if (drmModePageFlip(platform.drm.fd, platform.drm.crtc_id, platform.gbm.next_fb, 0, NULL) != 0) {
-    drmModeSetCrtc(platform.drm.fd, platform.drm.crtc_id, platform.gbm.next_fb, 0, 0,
-                   &platform.drm.connector_id, 1, &platform.drm.mode);
+  if (platform.drm.display_state == DISPLAY_STATE_WAKE_PENDING) {
+    if (drmModeSetCrtc(platform.drm.fd, platform.drm.crtc_id, platform.gbm.next_fb, 0, 0,
+                       &platform.drm.connector_id, 1, &platform.drm.mode) != 0) {
+      TRACELOG(LOG_WARNING, "COMMA: Failed to enable display: %s", strerror(errno));
+      gbm_surface_release_buffer(platform.gbm.surface, platform.gbm.next_bo);
+      platform.gbm.next_bo = NULL;
+      platform.gbm.next_fb = 0;
+      return;
+    }
+    platform.drm.display_state = DISPLAY_STATE_ACTIVE;
+  } else {
+    // page flip may return EBUSY when GPU compute shares the DRM device (mainline MSM DRM).
+    // fall back to blocking drmModeSetCrtc to force the display update through.
+    // without this, back-to-back compute submits starve the page flip and the UI never recovers.
+    if (drmModePageFlip(platform.drm.fd, platform.drm.crtc_id, platform.gbm.next_fb, 0, NULL) != 0) {
+      drmModeSetCrtc(platform.drm.fd, platform.drm.crtc_id, platform.gbm.next_fb, 0, 0,
+                     &platform.drm.connector_id, 1, &platform.drm.mode);
+    }
   }
 
   drmVBlank v = {0};
