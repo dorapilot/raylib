@@ -45,6 +45,7 @@
 *     3. This notice may not be removed or altered from any source distribution.
 *
 **********************************************************************************************/
+#include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,11 +55,13 @@
 #include <unistd.h>
 
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <sys/un.h>
 
 #include <linux/input.h>
 
 #include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <EGL/eglplatform.h>
 
 #include <GLES2/gl2.h>
@@ -89,6 +92,7 @@ struct finger {
 struct touch {
   struct finger fingers[MAX_TOUCH_POINTS];
   int fd;
+  int slot;
 };
 
 // hold all the low level egl stuff
@@ -104,7 +108,6 @@ struct drm_platform {
 
   uint32_t connector_id;
   uint32_t crtc_id;
-  bool needs_modeset;
 
   drmModeModeInfo mode;
 };
@@ -449,7 +452,7 @@ static int init_egl () {
      return -1;
    }
 
-   platform.egl.display = eglGetDisplay(platform.gbm.device);
+   platform.egl.display = eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, platform.gbm.device, NULL);
    if (platform.egl.display == EGL_NO_DISPLAY) {
      TRACELOG(LOG_WARNING, "COMMA: Failed to get an EGL display");
      return -1;
@@ -476,14 +479,16 @@ static int init_egl () {
      return -1;
    }
 
+   uint32_t selected_gbm_format = 0;
    for (int i = 0; i < num_config; ++i) {
      EGLint gbm_format;
      if (!eglGetConfigAttrib(platform.egl.display, configs[i], EGL_NATIVE_VISUAL_ID, &gbm_format)) {
        continue;
      }
 
-     if (gbm_format == GBM_FORMAT_ABGR8888) {
+     if (gbm_format == GBM_FORMAT_ABGR8888 || gbm_format == GBM_FORMAT_ARGB8888 || gbm_format == GBM_FORMAT_XRGB8888) {
        config = configs[i];
+       selected_gbm_format = gbm_format;
        free(configs);
        break;
      }
@@ -494,7 +499,7 @@ static int init_egl () {
      return -1;
    }
 
-   platform.gbm.surface = gbm_surface_create(platform.gbm.device, platform.drm.mode.hdisplay, platform.drm.mode.vdisplay, GBM_FORMAT_ABGR8888, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+   platform.gbm.surface = gbm_surface_create(platform.gbm.device, platform.drm.mode.hdisplay, platform.drm.mode.vdisplay, selected_gbm_format, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
    if (!platform.gbm.surface) {
      TRACELOG(LOG_WARNING, "COMMA: Failed to create gbm surface");
      return -1;
@@ -550,7 +555,7 @@ static int get_or_create_fb_for_bo(struct gbm_bo *bo, uint32_t *out_fb) {
     uint32_t offsets[4] = { 0 };
     uint32_t fb_id = 0;
 
-    if (drmModeAddFB2(platform.drm.fd, w, h, GBM_FORMAT_ABGR8888, handles, pitches, offsets, &fb_id, 0) != 0) {
+    if (drmModeAddFB2(platform.drm.fd, w, h, gbm_bo_get_format(bo), handles, pitches, offsets, &fb_id, 0) != 0) {
       return -1;
     }
 
@@ -578,8 +583,31 @@ static FILE* open_with_retry(const char *path, const char *mode) {
   return NULL;
 }
 
+static const char *find_backlight(void) {
+  static char path[256];
+  DIR *d = opendir("/sys/class/backlight");
+  if (!d) return NULL;
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (ent->d_name[0] == '.') continue;
+    snprintf(path, sizeof(path), "/sys/class/backlight/%s", ent->d_name);
+    closedir(d);
+    return path;
+  }
+  closedir(d);
+  return NULL;
+}
+
 static int turn_screen_on () {
-  FILE *f = open_with_retry("/sys/class/backlight/panel0-backlight/bl_power", "w");
+  const char *bl = find_backlight();
+  if (!bl) {
+    TRACELOG(LOG_WARNING, "COMMA: No backlight device found");
+    return -1;
+  }
+
+  char filepath[512];
+  snprintf(filepath, sizeof(filepath), "%s/bl_power", bl);
+  FILE *f = open_with_retry(filepath, "w");
   if (f) {
     fputs("0", f);
     fclose(f);
@@ -589,7 +617,8 @@ static int turn_screen_on () {
   }
 
   unsigned long max_brightness = 0;
-  f = open_with_retry("/sys/class/backlight/panel0-backlight/max_brightness", "r");
+  snprintf(filepath, sizeof(filepath), "%s/max_brightness", bl);
+  f = open_with_retry(filepath, "r");
   if (f) {
     if (fscanf(f, "%lu", &max_brightness) != 1) {
       TRACELOG(LOG_WARNING, "COMMA: Failed to read max_brightness");
@@ -602,7 +631,8 @@ static int turn_screen_on () {
     return -1;
   }
 
-  f = open_with_retry("/sys/class/backlight/panel0-backlight/brightness", "w");
+  snprintf(filepath, sizeof(filepath), "%s/brightness", bl);
+  f = open_with_retry(filepath, "w");
   if (f) {
     max_brightness = (int)((max_brightness / 100.0 ) * 65.0);
     fprintf(f, "%lu", max_brightness);
@@ -634,13 +664,6 @@ static int init_screen () {
     return -1;
   }
 
-  drmModeCrtc *crtc = drmModeGetCrtc(platform.drm.fd, platform.drm.crtc_id);
-  if (!((crtc->mode_valid != 0) && (crtc->buffer_id != 0))) {
-    platform.drm.needs_modeset = true;
-  }
-
-  drmModeFreeCrtc(crtc);
-
   if (turn_screen_on()) {
     TRACELOG(LOG_WARNING, "COMMA: Failed to turn screen on");
     return -1;
@@ -668,18 +691,37 @@ static int init_touch(const char *dev_path) {
       platform.canonical_zero = origin == 1;
     }
   } else {
-    TRACELOG(LOG_WARNING, "COMMA: Failed to open screen origin");
-    platform.canonical_zero = false;
+    // Mainline identifies comma four through device tree instead of som_id.
+    char compatible[sizeof("comma,mici")];
+    fp = fopen("/proc/device-tree/compatible", "r");
+    platform.canonical_zero = fp != NULL &&
+                              fread(compatible, 1, sizeof(compatible), fp) == sizeof(compatible) &&
+                              memcmp(compatible, "comma,mici", sizeof(compatible)) == 0;
+    if (fp != NULL) fclose(fp);
+    else TRACELOG(LOG_WARNING, "COMMA: Failed to open screen origin");
   }
 
+  // evdev omits unchanged coordinates, including on the first contact.
+  int x[MAX_TOUCH_POINTS + 1] = { ABS_MT_POSITION_X };
+  int y[MAX_TOUCH_POINTS + 1] = { ABS_MT_POSITION_Y };
+  bool have_positions = ioctl(platform.touch.fd, EVIOCGMTSLOTS(sizeof(x)), x) == 0 &&
+                        ioctl(platform.touch.fd, EVIOCGMTSLOTS(sizeof(y)), y) == 0;
+  if (!have_positions) TRACELOG(LOG_WARNING, "COMMA: Failed to read initial touch positions");
+
+  struct input_absinfo slot = {0};
+  if (ioctl(platform.touch.fd, EVIOCGABS(ABS_MT_SLOT), &slot) < 0) {
+    TRACELOG(LOG_WARNING, "COMMA: Failed to read initial touch slot");
+  }
+  platform.touch.slot = slot.value;
+
   for (int i = 0; i < MAX_TOUCH_POINTS; ++i) {
-    platform.touch.fingers[i].x = -1;
-    platform.touch.fingers[i].y = -1;
+    platform.touch.fingers[i].x = have_positions ? (platform.canonical_zero ? CORE.Window.screen.width - y[i + 1] : y[i + 1]) : -1;
+    platform.touch.fingers[i].y = have_positions ? (platform.canonical_zero ? x[i + 1] : CORE.Window.screen.height - x[i + 1]) : -1;
     platform.touch.fingers[i].state = FINGER_STATE_REMOVED;
     platform.touch.fingers[i].resetNextFrame = false;
 
-    CORE.Input.Touch.currentTouchState[0] = 0;
-    CORE.Input.Touch.previousTouchState[0] = 0;
+    CORE.Input.Touch.currentTouchState[i] = 0;
+    CORE.Input.Touch.previousTouchState[i] = 0;
   }
 
   for (int i = 0; i < MAX_MOUSE_BUTTONS; ++i) {
@@ -938,41 +980,36 @@ void SwapScreenBuffer(void) {
     return;
   }
 
-  if (platform.drm.needs_modeset) {
-    if (drmModeSetCrtc(platform.drm.fd, platform.drm.crtc_id, platform.gbm.next_fb, 0, 0, &platform.drm.connector_id, 1, &platform.drm.mode) != 0) {
-      TRACELOG(LOG_WARNING, "COMMA: Failed to set CRTC");
-      drmModeRmFB(platform.drm.fd, platform.gbm.next_fb);
-      gbm_surface_release_buffer(platform.gbm.surface, platform.gbm.next_bo);
-      platform.gbm.next_bo = NULL;
-      platform.gbm.next_fb = 0;
-      return;
-    }
-    platform.drm.needs_modeset = false;
-  } else if (drmModePageFlip(platform.drm.fd, platform.drm.crtc_id, platform.gbm.next_fb, 0, NULL) != 0) {
-    TRACELOG(LOG_WARNING, "COMMA: Failed to page flip");
-    drmModeRmFB(platform.drm.fd, platform.gbm.next_fb);
+  // magic.py clients share a DRM event queue. A blocking update keeps
+  // completion local to this call before the previous buffer is released.
+  if (drmModeSetCrtc(platform.drm.fd, platform.drm.crtc_id, platform.gbm.next_fb, 0, 0,
+                     &platform.drm.connector_id, 1, &platform.drm.mode) != 0) {
+    int display_error = errno;
     gbm_surface_release_buffer(platform.gbm.surface, platform.gbm.next_bo);
     platform.gbm.next_bo = NULL;
-    platform.gbm.next_fb = 0;
+    TRACELOG(LOG_WARNING, "COMMA: Display update failed: %s", strerror(display_error));
     return;
   }
 
-  drmVBlank v = {0};
-  v.request.type = DRM_VBLANK_RELATIVE;
-  v.request.sequence = 1;
-  drmWaitVBlank(platform.drm.fd, &v);
   if (platform.debug_mode) {
-    if ((v.reply.sequence - vblank_id) > 1) {
-      TRACELOG(LOG_WARNING, "%i FRAME(s) DROPPED!", (v.reply.sequence - vblank_id) - 1);
+    drmVBlank v = {0};
+    v.request.type = DRM_VBLANK_RELATIVE;
+    if (drmWaitVBlank(platform.drm.fd, &v) != 0) {
+      TRACELOG(LOG_WARNING, "COMMA: Reading display sequence failed: %s", strerror(errno));
+    } else {
+      if (vblank_id && (v.reply.sequence - vblank_id) > 1) {
+        TRACELOG(LOG_WARNING, "%i FRAME(s) DROPPED!", (v.reply.sequence - vblank_id) - 1);
+      }
+      vblank_id = v.reply.sequence;
     }
   }
-  vblank_id = v.reply.sequence;
 
   if (platform.gbm.current_bo) {
     gbm_surface_release_buffer(platform.gbm.surface, platform.gbm.current_bo);
   }
 
   platform.gbm.current_bo = platform.gbm.next_bo;
+  platform.gbm.current_fb = platform.gbm.next_fb;
 }
 
 //----------------------------------------------------------------------------------
@@ -1027,9 +1064,6 @@ const char *GetKeyName(int key) {
 }
 
 void PollInputEvents(void) {
-  // slot i is for events of finger i
-  static int slot = 0;
-
   for (int i = 0; i < MAX_TOUCH_POINTS; ++i) {
     CORE.Input.Touch.previousTouchState[i] = CORE.Input.Touch.currentTouchState[i];
     // caused by single frame down and up events
@@ -1081,9 +1115,18 @@ void PollInputEvents(void) {
     } else if (event.type == EV_ABS) { // raw events. Process these untill we get a sync frame
 
       if (event.code == ABS_MT_SLOT) { // switch finger
-        slot = event.value;
-      } else if (event.code == ABS_MT_TRACKING_ID) { // finger on screen or not
-        platform.touch.fingers[slot].state = event.value == -1 ? FINGER_STATE_REMOVING : FINGER_STATE_TOUCHING;
+        platform.touch.slot = event.value;
+        continue;
+      }
+      int slot = platform.touch.slot;
+      if (slot < 0 || slot >= MAX_TOUCH_POINTS) continue;
+
+      if (event.code == ABS_MT_TRACKING_ID) { // finger on screen or not
+        if (event.value >= 0) {
+          platform.touch.fingers[slot].state = FINGER_STATE_TOUCHING;
+        } else if (platform.touch.fingers[slot].state == FINGER_STATE_TOUCHING) {
+          platform.touch.fingers[slot].state = FINGER_STATE_REMOVING;
+        }
       } else if (event.code == ABS_MT_POSITION_X) {
         platform.touch.fingers[slot].y = (1 - platform.canonical_zero) * (CORE.Window.screen.height - event.value) + (platform.canonical_zero * event.value);
       } else if (event.code == ABS_MT_POSITION_Y) {
@@ -1130,9 +1173,8 @@ int InitPlatform(void) {
     return -1;
   }
 
-  if (init_touch("/dev/input/event2")) {
-    TRACELOG(LOG_FATAL, "COMMA: Failed to initialize touch device");
-    return -1;
+  if (init_touch("/dev/input/by-path/platform-894000.i2c-event")) {
+    TRACELOG(LOG_WARNING, "COMMA: Failed to initialize touch device, continuing without touch");
   }
 
   if (init_screen()) {
@@ -1175,9 +1217,14 @@ void ClosePlatform(void) {
     platform.egl.display = EGL_NO_DISPLAY;
   }
 
-  if (platform.gbm.surface && platform.gbm.next_bo) {
-    gbm_surface_release_buffer(platform.gbm.surface, platform.gbm.next_bo);
+  if (platform.gbm.surface) {
+    if (platform.gbm.current_bo && platform.gbm.current_bo != platform.gbm.next_bo) {
+      gbm_surface_release_buffer(platform.gbm.surface, platform.gbm.current_bo);
+    }
+    if (platform.gbm.next_bo) gbm_surface_release_buffer(platform.gbm.surface, platform.gbm.next_bo);
   }
+  platform.gbm.current_bo = NULL;
+  platform.gbm.next_bo = NULL;
 
   if (platform.gbm.device) {
     gbm_device_destroy(platform.gbm.device);
