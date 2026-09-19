@@ -55,6 +55,7 @@
 #include <unistd.h>
 
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <sys/un.h>
 
 #include <linux/input.h>
@@ -91,6 +92,7 @@ struct finger {
 struct touch {
   struct finger fingers[MAX_TOUCH_POINTS];
   int fd;
+  int slot;
 };
 
 // hold all the low level egl stuff
@@ -699,14 +701,27 @@ static int init_touch(const char *dev_path) {
     platform.canonical_zero = false;
   }
 
+  // evdev omits unchanged coordinates, including on the first contact.
+  int x[MAX_TOUCH_POINTS + 1] = { ABS_MT_POSITION_X };
+  int y[MAX_TOUCH_POINTS + 1] = { ABS_MT_POSITION_Y };
+  bool have_positions = ioctl(platform.touch.fd, EVIOCGMTSLOTS(sizeof(x)), x) == 0 &&
+                        ioctl(platform.touch.fd, EVIOCGMTSLOTS(sizeof(y)), y) == 0;
+  if (!have_positions) TRACELOG(LOG_WARNING, "COMMA: Failed to read initial touch positions");
+
+  struct input_absinfo slot = {0};
+  if (ioctl(platform.touch.fd, EVIOCGABS(ABS_MT_SLOT), &slot) < 0) {
+    TRACELOG(LOG_WARNING, "COMMA: Failed to read initial touch slot");
+  }
+  platform.touch.slot = slot.value;
+
   for (int i = 0; i < MAX_TOUCH_POINTS; ++i) {
-    platform.touch.fingers[i].x = -1;
-    platform.touch.fingers[i].y = -1;
+    platform.touch.fingers[i].x = have_positions ? (platform.canonical_zero ? CORE.Window.screen.width - y[i + 1] : y[i + 1]) : -1;
+    platform.touch.fingers[i].y = have_positions ? (platform.canonical_zero ? x[i + 1] : CORE.Window.screen.height - x[i + 1]) : -1;
     platform.touch.fingers[i].state = FINGER_STATE_REMOVED;
     platform.touch.fingers[i].resetNextFrame = false;
 
-    CORE.Input.Touch.currentTouchState[0] = 0;
-    CORE.Input.Touch.previousTouchState[0] = 0;
+    CORE.Input.Touch.currentTouchState[i] = 0;
+    CORE.Input.Touch.previousTouchState[i] = 0;
   }
 
   for (int i = 0; i < MAX_MOUSE_BUTTONS; ++i) {
@@ -1043,9 +1058,6 @@ const char *GetKeyName(int key) {
 }
 
 void PollInputEvents(void) {
-  // slot i is for events of finger i
-  static int slot = 0;
-
   for (int i = 0; i < MAX_TOUCH_POINTS; ++i) {
     CORE.Input.Touch.previousTouchState[i] = CORE.Input.Touch.currentTouchState[i];
     // caused by single frame down and up events
@@ -1097,9 +1109,18 @@ void PollInputEvents(void) {
     } else if (event.type == EV_ABS) { // raw events. Process these untill we get a sync frame
 
       if (event.code == ABS_MT_SLOT) { // switch finger
-        slot = event.value;
-      } else if (event.code == ABS_MT_TRACKING_ID) { // finger on screen or not
-        platform.touch.fingers[slot].state = event.value == -1 ? FINGER_STATE_REMOVING : FINGER_STATE_TOUCHING;
+        platform.touch.slot = event.value;
+        continue;
+      }
+      int slot = platform.touch.slot;
+      if (slot < 0 || slot >= MAX_TOUCH_POINTS) continue;
+
+      if (event.code == ABS_MT_TRACKING_ID) { // finger on screen or not
+        if (event.value >= 0) {
+          platform.touch.fingers[slot].state = FINGER_STATE_TOUCHING;
+        } else if (platform.touch.fingers[slot].state == FINGER_STATE_TOUCHING) {
+          platform.touch.fingers[slot].state = FINGER_STATE_REMOVING;
+        }
       } else if (event.code == ABS_MT_POSITION_X) {
         platform.touch.fingers[slot].y = (1 - platform.canonical_zero) * (CORE.Window.screen.height - event.value) + (platform.canonical_zero * event.value);
       } else if (event.code == ABS_MT_POSITION_Y) {
