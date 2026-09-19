@@ -980,30 +980,36 @@ void SwapScreenBuffer(void) {
     return;
   }
 
-  // page flip may return EBUSY when GPU compute shares the DRM device (mainline MSM DRM).
-  // fall back to blocking drmModeSetCrtc to force the display update through.
-  // without this, back-to-back compute submits starve the page flip and the UI never recovers.
-  if (drmModePageFlip(platform.drm.fd, platform.drm.crtc_id, platform.gbm.next_fb, 0, NULL) != 0) {
-    drmModeSetCrtc(platform.drm.fd, platform.drm.crtc_id, platform.gbm.next_fb, 0, 0,
-                   &platform.drm.connector_id, 1, &platform.drm.mode);
+  // magic.py clients share a DRM event queue. A blocking update keeps
+  // completion local to this call before the previous buffer is released.
+  if (drmModeSetCrtc(platform.drm.fd, platform.drm.crtc_id, platform.gbm.next_fb, 0, 0,
+                     &platform.drm.connector_id, 1, &platform.drm.mode) != 0) {
+    int display_error = errno;
+    gbm_surface_release_buffer(platform.gbm.surface, platform.gbm.next_bo);
+    platform.gbm.next_bo = NULL;
+    TRACELOG(LOG_WARNING, "COMMA: Display update failed: %s", strerror(display_error));
+    return;
   }
 
-  drmVBlank v = {0};
-  v.request.type = DRM_VBLANK_RELATIVE;
-  v.request.sequence = 1;
-  drmWaitVBlank(platform.drm.fd, &v);
   if (platform.debug_mode) {
-    if ((v.reply.sequence - vblank_id) > 1) {
-      TRACELOG(LOG_WARNING, "%i FRAME(s) DROPPED!", (v.reply.sequence - vblank_id) - 1);
+    drmVBlank v = {0};
+    v.request.type = DRM_VBLANK_RELATIVE;
+    if (drmWaitVBlank(platform.drm.fd, &v) != 0) {
+      TRACELOG(LOG_WARNING, "COMMA: Reading display sequence failed: %s", strerror(errno));
+    } else {
+      if (vblank_id && (v.reply.sequence - vblank_id) > 1) {
+        TRACELOG(LOG_WARNING, "%i FRAME(s) DROPPED!", (v.reply.sequence - vblank_id) - 1);
+      }
+      vblank_id = v.reply.sequence;
     }
   }
-  vblank_id = v.reply.sequence;
 
   if (platform.gbm.current_bo) {
     gbm_surface_release_buffer(platform.gbm.surface, platform.gbm.current_bo);
   }
 
   platform.gbm.current_bo = platform.gbm.next_bo;
+  platform.gbm.current_fb = platform.gbm.next_fb;
 }
 
 //----------------------------------------------------------------------------------
@@ -1209,9 +1215,14 @@ void ClosePlatform(void) {
     platform.egl.display = EGL_NO_DISPLAY;
   }
 
-  if (platform.gbm.surface && platform.gbm.next_bo) {
-    gbm_surface_release_buffer(platform.gbm.surface, platform.gbm.next_bo);
+  if (platform.gbm.surface) {
+    if (platform.gbm.current_bo && platform.gbm.current_bo != platform.gbm.next_bo) {
+      gbm_surface_release_buffer(platform.gbm.surface, platform.gbm.current_bo);
+    }
+    if (platform.gbm.next_bo) gbm_surface_release_buffer(platform.gbm.surface, platform.gbm.next_bo);
   }
+  platform.gbm.current_bo = NULL;
+  platform.gbm.next_bo = NULL;
 
   if (platform.gbm.device) {
     gbm_device_destroy(platform.gbm.device);
