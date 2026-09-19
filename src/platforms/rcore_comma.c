@@ -697,8 +697,14 @@ static int init_touch(const char *dev_path) {
       platform.canonical_zero = origin == 1;
     }
   } else {
-    TRACELOG(LOG_WARNING, "COMMA: Failed to open screen origin");
-    platform.canonical_zero = false;
+    // Mainline identifies comma four through device tree instead of som_id.
+    char compatible[sizeof("comma,mici")];
+    fp = fopen("/proc/device-tree/compatible", "r");
+    platform.canonical_zero = fp != NULL &&
+                              fread(compatible, 1, sizeof(compatible), fp) == sizeof(compatible) &&
+                              memcmp(compatible, "comma,mici", sizeof(compatible)) == 0;
+    if (fp != NULL) fclose(fp);
+    else TRACELOG(LOG_WARNING, "COMMA: Failed to open screen origin");
   }
 
   // evdev omits unchanged coordinates, including on the first contact.
